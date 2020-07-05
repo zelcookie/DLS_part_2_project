@@ -14,10 +14,10 @@ def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
-class HardConcrete(nn.Module):
+class PruneMask(nn.Module):
 
     def __init__(self,
-                 emb_dim,
+                 heads,
                  init_mean=0.5,
                  init_std=0.01,
                  beta=1.0,
@@ -26,10 +26,10 @@ class HardConcrete(nn.Module):
                         ):
         super().__init__()
 
-        self.emb_dim = emb_dim
+        self.heads =heads
         self.limit_l = -stretch
         self.limit_r = 1.0 + stretch
-        self.log_alpha = nn.Parameter(torch.zeros(self.emb_dim))
+        self.log_alpha = nn.Parameter(torch.zeros(self.heads))
         self.beta = beta
         self.init_mean = init_mean
         self.init_std = init_std
@@ -43,15 +43,16 @@ class HardConcrete(nn.Module):
     def forward(self):
         if self.training:
 
-            u = self.log_alpha.new(self.emb_dim).uniform_(0, 1)
+            u = self.log_alpha.new(self.heads).uniform_(0, 1)
             s = F.sigmoid((torch.log(u)- torch.log(1 - u) + self.log_alpha) / self.beta)
+            #s = F.sigmoid(self.log_alpha / self.beta)
             s = s * (self.limit_r - self.limit_l) + self.limit_l
             mask = s.clamp(min=0., max=1.)
 
         else:
             soft_mask = F.sigmoid(self.log_alpha / self.beta)
-            mask = (soft_mask>0.5).dtype(torch.long)
-
+            mask = (soft_mask>0.5).type(torch.long)
+        #print(self.log_alpha)
         return mask
 
 
@@ -108,6 +109,8 @@ class MultiheadAttentionPrune(nn.Module):
         self.linears = clones(nn.Linear(d_model, d_model), 4)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
+        self.prune_mask = PruneMask(h)
+        self.use_prune_mask=False
         
     def forward(self, query, key, value, mask=None):
         "Implements Figure 2"
@@ -126,8 +129,17 @@ class MultiheadAttentionPrune(nn.Module):
                                  dropout=self.dropout)
         
         # 3) "Concat" using a view and apply a final linear. 
+        if self.use_prune_mask:
+            
+            
+            x = x * self.prune_mask().reshape(1,-1,1,1)
+#         print(x)
+#         print(self.prune_mask())
         x = x.transpose(1, 2).contiguous() \
              .view(nbatches, -1, self.h * self.d_k)
+#         print(x)
+#         print(self.prune_mask())
+#         print(self.linears[-1](x))
         return self.linears[-1](x)
     
     
@@ -177,16 +189,29 @@ class EncoderPrune(nn.Module):
         encoder_layer =  TransformerEncoderLayerPrune(emb_dim, heads, dropout=dropout)
         norm = nn.LayerNorm(emb_dim)
         self.transformer_encoder = TransformerEncoder(encoder_layer, n_layers, norm)
+        self.set_prune_mask_flag(False)
 
     def forward(self, src, src_key_padding_mask):
         embedded = self.embedding(src)
-        #print(embedded.shape)
+
         embedded = self.pe(embedded*math.sqrt(self.emb_dim))
-        #print(embedded)
+
         out = self.transformer_encoder(embedded, src_key_padding_mask=src_key_padding_mask)
         #print(out[:,:,2])
-        return out    
-
+        return out  
+   
+    def set_prune_mask_flag(self, flag):
+        for i, layer in enumerate(self.transformer_encoder.layers):
+            if i!=0:
+                layer.self_attn.use_prune_mask = flag
+            
+    def prune_loss(self):
+        loss = 0
+        for layer in self.transformer_encoder.layers:
+            
+            if layer.self_attn.use_prune_mask:
+                loss += layer.self_attn.prune_mask.l0_norm()
+        return loss
     
     
 class Encoder(nn.Module):
@@ -245,7 +270,7 @@ class Seq2Seq(nn.Module):
         #self._init_weights() 
         self.max_len=30
     
-    def forward(self, src, trg,src_key_padding_mask, tgt_key_padding_mask, tgt_mask, teacher_forcing_ratio = 0.5):
+    def forward(self, src, trg,src_key_padding_mask, tgt_key_padding_mask, tgt_mask, teacher_forcing_ratio = 0.5, return_prune_loss=False):
         """
         :param: src (src_len x batch_size)
         :param: tgt
@@ -272,38 +297,8 @@ class Seq2Seq(nn.Module):
 # #             input = (trg[t] if teacher_force else top1)
         
         outputs = self.decoder(trg,  enc_out,tgt_key_padding_mask, tgt_mask)
-        
+        if return_prune_loss:
+            prune_loss = self.encoder.prune_loss()
+            return outputs, prune_loss
         return outputs
-    
-    def translate(self, src):
-        
-        enc_out = self.encoder(src)
-        
-        
-        
-        trg_vocab_size = self.decoder.output_dim
-        
-        #tensor to store decoder outputs
-        outputs = []
-        
-        #last hidden state of the encoder is used as the initial hidden state of the decoder
-        src = torch.tensor(src).to(self.device)
-        enc_out, hidden, cell = self.encoder(src) # TODO pass src throw encoder
-        
-        #first input to the decoder is the <sos> tokens
-        input = torch.tensor([TRG.vocab['<sos>']]).to(device)# TODO trg[idxs]
-        
-        
-        for t in range(1, self.max_len):
-            output, hidden, cell = self.decoder(input, hidden, cell, enc_out) #TODO pass state and input throw decoder 
-            top1 = output.max(1)[1]
-            outputs.append(top1)
-            input = (top1)
-        
-        return outputs
-    
-    def _init_weights(self):
-        p = 0.08
-        for name, param in self.named_parameters():
-            nn.init.uniform_(param.data, -p, p)    
     
