@@ -33,15 +33,17 @@ class PositionalEncoding(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, input_dim, emb_dim, n_layers, heads, dropout=0.1):
         super().__init__()
+        self.emb_dim=emb_dim
         self.embedding = nn.Embedding(input_dim, emb_dim)
         self.pe = PositionalEncoding(emb_dim, dropout)
         encoder_layer =  TransformerEncoderLayer(emb_dim, heads, dropout=dropout)
-        self.transformer_encoder = TransformerEncoder(encoder_layer, n_layers)
+        norm = nn.LayerNorm(emb_dim)
+        self.transformer_encoder = TransformerEncoder(encoder_layer, n_layers, norm)
 
     def forward(self, src, src_key_padding_mask):
         embedded = self.embedding(src)
         #print(embedded.shape)
-        embedded = self.pe(embedded)
+        embedded = self.pe(embedded*math.sqrt(self.emb_dim))
         #print(embedded)
         out = self.transformer_encoder(embedded, src_key_padding_mask=src_key_padding_mask)
         #print(out[:,:,2])
@@ -51,17 +53,19 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, output_dim, emb_dim, n_layers, heads, dropout=0.1):
         super().__init__()
+        self.emb_dim=emb_dim
         self.output_dim = output_dim 
         self.embedding = nn.Embedding(output_dim, emb_dim)
         self.pe = PositionalEncoding(emb_dim, dropout)
         decoder_layer = TransformerDecoderLayer(emb_dim, heads, dropout=dropout)
-        self.transformer_decoder = TransformerDecoder(decoder_layer, n_layers)
+        norm = nn.LayerNorm(emb_dim)
+        self.transformer_decoder = TransformerDecoder(decoder_layer, n_layers, norm)
         self.out = nn.Linear(emb_dim, self.output_dim)
 
     def forward(self, trg, encoder_out,tgt_key_padding_mask, tgt_mask):
         embedded = self.embedding(trg)
         #print(embedded.shape)
-        embedded = self.pe(embedded)
+        embedded = self.pe(embedded*math.sqrt(self.emb_dim))
         #print(embedded.shape, encoder_out.shape, tgt_mask.shape,tgt_key_padding_mask.shape )
         
         out = self.transformer_decoder(embedded, encoder_out, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
